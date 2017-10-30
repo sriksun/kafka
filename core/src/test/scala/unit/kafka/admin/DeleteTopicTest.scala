@@ -178,11 +178,12 @@ class DeleteTopicTest extends ZooKeeperTestHarness {
   def testAddPartitionDuringDeleteTopic() {
     val topic = "test"
     servers = createTestTopicAndCluster(topic)
+    val brokers = AdminUtils.getBrokerMetadatas(zkUtils)
     // start topic deletion
     AdminUtils.deleteTopic(zkUtils, topic)
     // add partitions to topic
     val newPartition = new TopicPartition(topic, 1)
-    AdminUtils.addPartitions(zkUtils, topic, expectedReplicaAssignment, AdminUtils.getBrokerMetadatas(zkUtils), 2,
+    AdminUtils.addPartitions(zkUtils, topic, expectedReplicaAssignment, brokers, 2,
       Some(Map(1 -> Seq(0, 1, 2), 2 -> Seq(0, 1, 2))))
     TestUtils.verifyTopicDeletion(zkUtils, topic, 1, servers)
     // verify that new partition doesn't exist on any broker either
@@ -220,7 +221,7 @@ class DeleteTopicTest extends ZooKeeperTestHarness {
     } catch {
       case _: UnknownTopicOrPartitionException => // expected exception
     }
-    // verify delete topic path for test2 is removed from zookeeper
+    // verify delete topic path for test2 is removed from ZooKeeper
     TestUtils.verifyTopicDeletion(zkUtils, "test2", 1, servers)
     // verify that topic test is untouched
     TestUtils.waitUntilTrue(() => servers.forall(_.getLogManager().getLog(topicPartition).isDefined),

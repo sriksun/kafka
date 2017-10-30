@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package unit.kafka.server
+package kafka.server
 
 import java.lang.{Long => JLong}
 import java.net.InetAddress
@@ -30,8 +30,8 @@ import kafka.log.{Log, TimestampOffset}
 import kafka.network.RequestChannel
 import kafka.security.auth.Authorizer
 import kafka.server.QuotaFactory.QuotaManagers
-import kafka.server._
 import kafka.utils.{MockTime, TestUtils, ZkUtils}
+import kafka.zk.KafkaZkClient
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.errors.UnsupportedVersionException
 import org.apache.kafka.common.memory.MemoryPool
@@ -61,6 +61,7 @@ class KafkaApisTest {
   private val txnCoordinator = EasyMock.createNiceMock(classOf[TransactionCoordinator])
   private val controller = EasyMock.createNiceMock(classOf[KafkaController])
   private val zkUtils = EasyMock.createNiceMock(classOf[ZkUtils])
+  private val zkClient = EasyMock.createNiceMock(classOf[KafkaZkClient])
   private val metadataCache = EasyMock.createNiceMock(classOf[MetadataCache])
   private val metrics = new Metrics()
   private val brokerId = 1
@@ -68,7 +69,7 @@ class KafkaApisTest {
   private val clientQuotaManager = EasyMock.createNiceMock(classOf[ClientQuotaManager])
   private val clientRequestQuotaManager = EasyMock.createNiceMock(classOf[ClientRequestQuotaManager])
   private val replicaQuotaManager = EasyMock.createNiceMock(classOf[ReplicationQuotaManager])
-  private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager, replicaQuotaManager, replicaQuotaManager)
+  private val quotas = QuotaManagers(clientQuotaManager, clientQuotaManager, clientRequestQuotaManager, replicaQuotaManager, replicaQuotaManager, replicaQuotaManager)
   private val brokerTopicStats = new BrokerTopicStats
   private val clusterId = "clusterId"
   private val time = new MockTime
@@ -84,6 +85,7 @@ class KafkaApisTest {
       txnCoordinator,
       controller,
       zkUtils,
+      zkClient,
       brokerId,
       new KafkaConfig(properties),
       metadataCache,
@@ -180,6 +182,7 @@ class KafkaApisTest {
       EasyMock.eq(false),
       EasyMock.anyObject(),
       EasyMock.capture(responseCallback),
+      EasyMock.anyObject(),
       EasyMock.anyObject())).andAnswer(new IAnswer[Unit] {
       override def answer(): Unit = {
         responseCallback.getValue.apply(Map(tp2 -> new PartitionResponse(Errors.NONE)))
@@ -218,6 +221,7 @@ class KafkaApisTest {
       EasyMock.eq(false),
       EasyMock.anyObject(),
       EasyMock.capture(responseCallback),
+      EasyMock.anyObject(),
       EasyMock.anyObject())).andAnswer(new IAnswer[Unit] {
       override def answer(): Unit = {
         responseCallback.getValue.apply(Map(tp2 -> new PartitionResponse(Errors.NONE)))
@@ -246,6 +250,7 @@ class KafkaApisTest {
       EasyMock.anyShort(),
       EasyMock.eq(true),
       EasyMock.eq(false),
+      EasyMock.anyObject(),
       EasyMock.anyObject(),
       EasyMock.anyObject(),
       EasyMock.anyObject()))

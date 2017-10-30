@@ -24,7 +24,7 @@ import kafka.api.{ApiVersion, KAFKA_0_10_0_IV1, LeaderAndIsr}
 import kafka.cluster._
 import kafka.common.{KafkaException, NoEpochForPartitionException, TopicAndPartition}
 import kafka.consumer.{ConsumerThreadId, TopicCount}
-import kafka.controller.{KafkaController, LeaderIsrAndControllerEpoch, ReassignedPartitionsContext}
+import kafka.controller.{LeaderIsrAndControllerEpoch, ReassignedPartitionsContext}
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server.ConfigType
 import kafka.utils.ZkUtils._
@@ -252,6 +252,9 @@ class ZooKeeperClientMetrics(zkClient: ZkClient, val time: Time)
   }
 }
 
+/**
+ * Legacy class for interacting with ZooKeeper. Whenever possible, ``KafkaZkClient`` should be used instead.
+ */
 class ZkUtils(zkClientWrap: ZooKeeperClientWrapper,
               val zkConnection: ZkConnection,
               val isSecure: Boolean) extends Logging {
@@ -286,8 +289,26 @@ class ZkUtils(zkClientWrap: ZooKeeperClientWrapper,
 
   def getController(): Int = {
     readDataMaybeNull(ControllerPath)._1 match {
-      case Some(controller) => KafkaController.parseControllerId(controller)
+      case Some(controller) => parseControllerId(controller)
       case None => throw new KafkaException("Controller doesn't exist")
+    }
+  }
+
+  def parseControllerId(controllerInfoString: String): Int = {
+    try {
+      Json.parseFull(controllerInfoString) match {
+        case Some(js) => js.asJsonObject("brokerid").to[Int]
+        case None => throw new KafkaException("Failed to parse the controller info json [%s].".format(controllerInfoString))
+      }
+    } catch {
+      case _: Throwable =>
+        // It may be due to an incompatible controller register version
+        warn("Failed to parse the controller info as json. "
+          + "Probably this controller is still using the old format [%s] to store the broker id in zookeeper".format(controllerInfoString))
+        try controllerInfoString.toInt
+        catch {
+          case t: Throwable => throw new KafkaException("Failed to parse the controller info: " + controllerInfoString + ". This is neither the new or the old format.", t)
+        }
     }
   }
 

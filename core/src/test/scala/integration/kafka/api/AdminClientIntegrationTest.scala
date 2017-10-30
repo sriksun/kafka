@@ -21,6 +21,7 @@ import java.util.{Collections, Properties}
 import java.util.Arrays.asList
 import java.util.concurrent.{ExecutionException, TimeUnit}
 import java.io.File
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import org.apache.kafka.clients.admin.KafkaAdminClientTest
 import org.apache.kafka.common.utils.{Time, Utils}
@@ -31,6 +32,7 @@ import org.apache.kafka.clients.admin._
 import kafka.utils.{Logging, TestUtils, ZkUtils}
 import kafka.utils.Implicits._
 import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.{KafkaFuture, TopicPartition, TopicPartitionReplica}
 import org.apache.kafka.common.acl._
 import org.apache.kafka.common.config.ConfigResource
@@ -43,6 +45,8 @@ import org.junit.Assert._
 
 import scala.util.Random
 import scala.collection.JavaConverters._
+import scala.concurrent.duration.Duration
+import scala.concurrent.{Await, Future}
 
 /**
  * An integration test of the KafkaAdminClient.
@@ -74,9 +78,28 @@ class AdminClientIntegrationTest extends KafkaServerTestHarness with Logging {
   val brokerCount = 3
   lazy val serverConfig = new Properties
 
+  override def generateConfigs = {
+    val cfgs = TestUtils.createBrokerConfigs(brokerCount, zkConnect, interBrokerSecurityProtocol = Some(securityProtocol),
+      trustStoreFile = trustStoreFile, saslProperties = serverSaslProperties, logDirCount = 2)
+    cfgs.foreach { config =>
+      config.setProperty(KafkaConfig.ListenersProp, s"${listenerName.value}://localhost:${TestUtils.RandomPort}")
+      config.remove(KafkaConfig.InterBrokerSecurityProtocolProp)
+      config.setProperty(KafkaConfig.InterBrokerListenerNameProp, listenerName.value)
+      config.setProperty(KafkaConfig.ListenerSecurityProtocolMapProp, s"${listenerName.value}:${securityProtocol.name}")
+      config.setProperty(KafkaConfig.DeleteTopicEnableProp, "true")
+      // We set this in order to test that we don't expose sensitive data via describe configs. This will already be
+      // set for subclasses with security enabled and we don't want to overwrite it.
+      if (!config.containsKey(KafkaConfig.SslTruststorePasswordProp))
+        config.setProperty(KafkaConfig.SslTruststorePasswordProp, "some.invalid.pass")
+    }
+    cfgs.foreach(_ ++= serverConfig)
+    cfgs.map(KafkaConfig.fromProps)
+  }
+
   def createConfig(): util.Map[String, Object] = {
     val config = new util.HashMap[String, Object]
     config.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, brokerList)
+    config.put(AdminClientConfig.REQUEST_TIMEOUT_MS_CONFIG, "20000")
     val securityProps: util.Map[Object, Object] =
       TestUtils.adminClientSecurityConfigs(securityProtocol, trustStoreFile, clientSaslProperties)
     securityProps.asScala.foreach { case (key, value) => config.put(key.asInstanceOf[String], value) }
@@ -257,36 +280,89 @@ class AdminClientIntegrationTest extends KafkaServerTestHarness with Logging {
       val tp = new TopicPartition(topicPartitionReplica.topic(), topicPartitionReplica.partition())
       assertEquals(server.logManager.getLog(tp).get.dir.getParent, replicaDirInfo.getCurrentReplicaLogDir)
     }
-
-    client.close()
   }
 
   @Test
-  def testAlterReplicaLogDirsBeforeTopicCreation(): Unit = {
-    val adminClient = AdminClient.create(createConfig())
+  def testAlterReplicaLogDirs(): Unit = {
+    client = AdminClient.create(createConfig())
     val topic = "topic"
     val tp = new TopicPartition(topic, 0)
+    val randomNums = servers.map(server => server -> Random.nextInt(2)).toMap
 
-    val replicaAssignment = servers.map { server =>
-      val logDir = new File(server.config.logDirs(Random.nextInt(2))).getAbsolutePath
+    // Generate two mutually exclusive replicaAssignment
+    val firstReplicaAssignment = servers.map { server =>
+      val logDir = new File(server.config.logDirs(randomNums(server))).getAbsolutePath
+      new TopicPartitionReplica(topic, 0, server.config.brokerId) -> logDir
+    }.toMap
+    val secondReplicaAssignment = servers.map { server =>
+      val logDir = new File(server.config.logDirs(1 - randomNums(server))).getAbsolutePath
       new TopicPartitionReplica(topic, 0, server.config.brokerId) -> logDir
     }.toMap
 
-    adminClient.alterReplicaLogDirs(replicaAssignment.asJava, new AlterReplicaLogDirsOptions()).values().asScala.values.foreach { future =>
-      try {
-        future.get()
-        fail("Future should fail with ReplicaNotAvailableException")
-      } catch {
-        case e: ExecutionException => assertTrue(e.getCause.isInstanceOf[ReplicaNotAvailableException])
-      }
+    // Verify that replica can be created in the specified log directory
+    val futures = client.alterReplicaLogDirs(firstReplicaAssignment.asJava,
+      new AlterReplicaLogDirsOptions).values.asScala.values
+    futures.foreach { future =>
+      val exception = intercept[ExecutionException](future.get)
+      assertTrue(exception.getCause.isInstanceOf[ReplicaNotAvailableException])
     }
 
-    TestUtils.createTopic(zkUtils, topic, 1, brokerCount, servers, new Properties())
+    TestUtils.createTopic(zkUtils, topic, 1, brokerCount, servers, new Properties)
     servers.foreach { server =>
       val logDir = server.logManager.getLog(tp).get.dir.getParent
-      assertEquals(replicaAssignment(new TopicPartitionReplica(topic, 0, server.config.brokerId)), logDir)
+      assertEquals(firstReplicaAssignment(new TopicPartitionReplica(topic, 0, server.config.brokerId)), logDir)
     }
-    adminClient.close()
+
+    // Verify that replica can be moved to the specified log directory after the topic has been created
+    client.alterReplicaLogDirs(secondReplicaAssignment.asJava, new AlterReplicaLogDirsOptions).all.get
+    servers.foreach { server =>
+      TestUtils.waitUntilTrue(() => {
+        val logDir = server.logManager.getLog(tp).get.dir.getParent
+        secondReplicaAssignment(new TopicPartitionReplica(topic, 0, server.config.brokerId)) == logDir
+      }, "timed out waiting for replica movement", 6000L)
+    }
+
+    // Verify that replica can be moved to the specified log directory while the producer is sending messages
+    val running = new AtomicBoolean(true)
+    val numMessages = new AtomicInteger
+    import scala.concurrent.ExecutionContext.Implicits._
+    val producerFuture = Future {
+      val producer = TestUtils.createNewProducer(
+        TestUtils.getBrokerListStrFromServers(servers, protocol = securityProtocol),
+        securityProtocol = securityProtocol,
+        trustStoreFile = trustStoreFile,
+        retries = 0, // Producer should not have to retry when broker is moving replica between log directories.
+        requestTimeoutMs = 10000,
+        acks = -1
+      )
+      try {
+        while (running.get) {
+          val future = producer.send(new ProducerRecord(topic, s"xxxxxxxxxxxxxxxxxxxx-$numMessages".getBytes))
+          numMessages.incrementAndGet()
+          future.get(10, TimeUnit.SECONDS)
+        }
+        numMessages.get
+      } finally producer.close()
+    }
+
+    try {
+      TestUtils.waitUntilTrue(() => numMessages.get > 100, "timed out waiting for message produce", 6000L)
+      client.alterReplicaLogDirs(firstReplicaAssignment.asJava, new AlterReplicaLogDirsOptions).all.get
+      servers.foreach { server =>
+        TestUtils.waitUntilTrue(() => {
+          val logDir = server.logManager.getLog(tp).get.dir.getParent
+          firstReplicaAssignment(new TopicPartitionReplica(topic, 0, server.config.brokerId)) == logDir
+        }, "timed out waiting for replica movement", 6000L)
+      }
+    } finally running.set(false)
+
+    val finalNumMessages = Await.result(producerFuture, Duration(20, TimeUnit.SECONDS))
+
+    // Verify that all messages that are produced can be consumed
+    val consumerRecords = TestUtils.consumeTopicRecords(servers, topic, finalNumMessages, securityProtocol, trustStoreFile)
+    consumerRecords.zipWithIndex.foreach { case (consumerRecord, index) =>
+      assertEquals(s"xxxxxxxxxxxxxxxxxxxx-$index", new String(consumerRecord.value))
+    }
   }
 
   @Test
@@ -407,7 +483,7 @@ class AdminClientIntegrationTest extends KafkaServerTestHarness with Logging {
     alterResult = client.createPartitions(Map(topic2 ->
       NewPartitions.increaseTo(3, newPartition2Assignments)).asJava, actuallyDoIt)
     altered = alterResult.values.get(topic2).get
-    var actualPartitions2 = partitions(topic2)
+    val actualPartitions2 = partitions(topic2)
     assertEquals(3, actualPartitions2.size)
     assertEquals(Seq(0, 1), actualPartitions2.get(1).replicas.asScala.map(_.id).toList)
     assertEquals(Seq(1, 2), actualPartitions2.get(2).replicas.asScala.map(_.id).toList)
@@ -698,24 +774,6 @@ class AdminClientIntegrationTest extends KafkaServerTestHarness with Logging {
     val endTimeMs = Time.SYSTEM.milliseconds()
     assertTrue("Expected the timeout to take at least one millisecond.", endTimeMs > startTimeMs);
     client.close()
-  }
-
-  override def generateConfigs = {
-    val cfgs = TestUtils.createBrokerConfigs(brokerCount, zkConnect, interBrokerSecurityProtocol = Some(securityProtocol),
-      trustStoreFile = trustStoreFile, saslProperties = serverSaslProperties, logDirCount = 2)
-    cfgs.foreach { config =>
-      config.setProperty(KafkaConfig.ListenersProp, s"${listenerName.value}://localhost:${TestUtils.RandomPort}")
-      config.remove(KafkaConfig.InterBrokerSecurityProtocolProp)
-      config.setProperty(KafkaConfig.InterBrokerListenerNameProp, listenerName.value)
-      config.setProperty(KafkaConfig.ListenerSecurityProtocolMapProp, s"${listenerName.value}:${securityProtocol.name}")
-      config.setProperty(KafkaConfig.DeleteTopicEnableProp, "true")
-      // We set this in order to test that we don't expose sensitive data via describe configs. This will already be
-      // set for subclasses with security enabled and we don't want to overwrite it.
-      if (!config.containsKey(KafkaConfig.SslTruststorePasswordProp))
-        config.setProperty(KafkaConfig.SslTruststorePasswordProp, "some.invalid.pass")
-    }
-    cfgs.foreach(_ ++= serverConfig)
-    cfgs.map(KafkaConfig.fromProps)
   }
 
   /**
